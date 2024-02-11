@@ -1,0 +1,32 @@
+# Copyright (c) 2024 Joel Guittet
+# Copyright (c) 2024 Tim Sørensen
+# SPDX-License-Identifier: Apache-2.0
+
+if BOARD_WAVESHARE_ESP32S3_TOUCH_LCD_4_3
+
+config BOARD
+	default "waveshare_esp32s3_touch_lcd_4_3"
+
+config HEAP_MEM_POOL_SIZE
+	int
+	default 98304 if WIFI
+	default 40960 if BT
+	default 4096
+
+choice BT_HCI_BUS_TYPE
+	default BT_ESP32 if BT
+endchoice
+
+endif
+
+config ENTROPY_GENERATOR
+	default y
+
+config KERNEL_MEM_POOL
+	default y
+
+config PWM
+	default y if DISPLAY
+
+config LV_COLOR_16_SWAP
+	default y if LVGL

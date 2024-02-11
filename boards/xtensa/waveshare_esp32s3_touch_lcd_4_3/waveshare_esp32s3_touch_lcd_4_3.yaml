@@ -1,0 +1,22 @@
+identifier: waveshare_esp32s3_touch_lcd_4_3
+name: ESP32-S3-Touch-LCD-4.3
+type: mcu
+arch: xtensa
+toolchain:
+  - zephyr
+supported:
+  - gpio
+  - i2c
+  - spi
+  - watchdog
+  - regulator
+  - uart
+  - pwm
+  - pinmux
+  - nvs
+  - display
+testing:
+  ignore_tags:
+    - net
+    - bluetooth
+vendor: waveshare

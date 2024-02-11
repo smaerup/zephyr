@@ -1,0 +1,11 @@
+# Copyright (c) 2024 Joel Guittet
+# Copyright (c) 2024 Tim Sørensen
+# SPDX-License-Identifier: Apache-2.0
+
+config BOARD_WAVESHARE_ESP32S3_TOUCH_LCD_4_3
+	bool "ESP32-S3-Touch-LCD-4.3 Board"
+	depends on SOC_SERIES_ESP32S3
+
+choice SOC_PART_NUMBER
+	default SOC_ESP32S3_R2
+endchoice
