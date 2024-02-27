@@ -253,12 +253,7 @@ int pthread_mutexattr_gettype(const pthread_mutexattr_t *attr, int *type);
  *
  * Note that pthread attribute structs are currently noops in Zephyr.
  */
-static inline int pthread_mutexattr_init(pthread_mutexattr_t *m)
-{
-	ARG_UNUSED(m);
-
-	return 0;
-}
+int pthread_mutexattr_init(pthread_mutexattr_t *attr);
 
 /**
  * @brief POSIX threading compatibility API
@@ -267,12 +262,7 @@ static inline int pthread_mutexattr_init(pthread_mutexattr_t *m)
  *
  * Note that pthread attribute structs are currently noops in Zephyr.
  */
-static inline int pthread_mutexattr_destroy(pthread_mutexattr_t *m)
-{
-	ARG_UNUSED(m);
-
-	return 0;
-}
+int pthread_mutexattr_destroy(pthread_mutexattr_t *attr);
 
 /**
  * @brief Declare a pthread barrier
@@ -432,7 +422,7 @@ int pthread_attr_setstack(pthread_attr_t *attr, void *stackaddr,
 #ifdef CONFIG_PTHREAD_IPC
 int pthread_once(pthread_once_t *once, void (*initFunc)(void));
 #endif
-void pthread_exit(void *retval);
+FUNC_NORETURN void pthread_exit(void *retval);
 int pthread_join(pthread_t thread, void **status);
 int pthread_cancel(pthread_t pthread);
 int pthread_detach(pthread_t thread);

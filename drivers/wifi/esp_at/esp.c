@@ -7,6 +7,9 @@
 
 #define DT_DRV_COMPAT espressif_esp_at
 
+#undef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(wifi_esp_at, CONFIG_WIFI_LOG_LEVEL);
 
@@ -16,6 +19,7 @@ LOG_MODULE_REGISTER(wifi_esp_at, CONFIG_WIFI_LOG_LEVEL);
 #include <zephyr/device.h>
 #include <zephyr/init.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
@@ -319,7 +323,7 @@ MODEM_CMD_DEFINE(on_cmd_cwjap)
 	}
 
 	strncpy(status->ssid, ssid, sizeof(status->ssid));
-	status->ssid_len = strlen(status->ssid);
+	status->ssid_len = strnlen(status->ssid, sizeof(status->ssid));
 
 	err = net_bytes_from_str(status->bssid, sizeof(status->bssid), bssid);
 	if (err) {
@@ -447,7 +451,9 @@ static void esp_mgmt_disconnect_work(struct k_work *work)
 #if defined(CONFIG_NET_NATIVE_IPV4)
 	net_if_ipv4_addr_rm(dev->net_iface, &dev->ip);
 #endif
-	net_if_dormant_on(dev->net_iface);
+	if (!esp_flags_are_set(dev, EDF_AP_ENABLED)) {
+		net_if_dormant_on(dev->net_iface);
+	}
 	wifi_mgmt_raise_disconnect_result_event(dev->net_iface, 0);
 }
 
@@ -1070,12 +1076,18 @@ static int esp_mgmt_ap_enable(const struct device *dev,
 
 	ret = esp_cmd_send(data, NULL, 0, cmd, ESP_CMD_TIMEOUT);
 
+	net_if_dormant_off(data->net_iface);
+
 	return ret;
 }
 
 static int esp_mgmt_ap_disable(const struct device *dev)
 {
 	struct esp_data *data = dev->data;
+
+	if (!esp_flags_are_set(data, EDF_STA_CONNECTED)) {
+		net_if_dormant_on(data->net_iface);
+	}
 
 	return esp_mode_flags_clear(data, EDF_AP_ENABLED);
 }
@@ -1123,6 +1135,9 @@ static void esp_init_work(struct k_work *work)
 #endif
 #if defined(CONFIG_WIFI_ESP_AT_PASSIVE_MODE)
 		SETUP_CMD_NOHANDLE("AT+CIPRECVMODE=1"),
+#endif
+#if defined(CONFIG_WIFI_ESP_AT_CIPDINFO_USE)
+		SETUP_CMD_NOHANDLE("AT+CIPDINFO=1"),
 #endif
 		SETUP_CMD("AT+"_CIPSTAMAC"?", "+"_CIPSTAMAC":",
 			  on_cmd_cipstamac, 1U, ""),

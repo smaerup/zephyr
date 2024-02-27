@@ -105,12 +105,12 @@ static bool device_found(struct bt_data *data, void *user_data)
 			memcpy(&u16, &data->data[i], sizeof(u16));
 			uuid = BT_UUID_DECLARE_16(sys_le16_to_cpu(u16));
 
-			if (bt_uuid_cmp(uuid, BT_UUID_BASS)) {
+			if (bt_uuid_cmp(uuid, BT_UUID_BASS) == 0) {
 				sr_info->has_bass = true;
 				continue;
 			}
 
-			if (bt_uuid_cmp(uuid, BT_UUID_PACS)) {
+			if (bt_uuid_cmp(uuid, BT_UUID_PACS) == 0) {
 				sr_info->has_pacs = true;
 				continue;
 			}
@@ -401,7 +401,7 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 int main(void)
 {
 	int err;
-	struct bt_bap_scan_delegator_subgroup subgroup = { 0 };
+	struct bt_bap_bass_subgroup subgroup = { 0 };
 	struct bt_bap_broadcast_assistant_add_src_param param = { 0 };
 
 	err = bt_enable(NULL);

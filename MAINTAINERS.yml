@@ -888,8 +888,8 @@ Documentation Infrastructure:
 Release Notes:
   status: maintained
   maintainers:
-    - MaureenHelm
-    - henrikbrixandersen
+    - nashif
+    - aescolar
   collaborators:
     - kartben
   files:
@@ -1013,6 +1013,7 @@ Release Notes:
     - tests/drivers/charger/
     - doc/hardware/peripherals/charger.rst
     - tests/drivers/build_all/charger/
+    - samples/drivers/charger/
   labels:
     - "area: Charger"
   tests:

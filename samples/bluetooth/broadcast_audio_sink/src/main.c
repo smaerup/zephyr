@@ -26,7 +26,7 @@
 BUILD_ASSERT(IS_ENABLED(CONFIG_SCAN_SELF) || IS_ENABLED(CONFIG_SCAN_OFFLOAD),
 	     "Either SCAN_SELF or SCAN_OFFLOAD must be enabled");
 
-#define SEM_TIMEOUT K_SECONDS(10)
+#define SEM_TIMEOUT                 K_SECONDS(60)
 #define BROADCAST_ASSISTANT_TIMEOUT K_SECONDS(120) /* 2 minutes */
 
 #if defined(CONFIG_SCAN_SELF)
@@ -122,6 +122,8 @@ static uint32_t bis_index_bitfield;
 static uint8_t sink_broadcast_code[BT_AUDIO_BROADCAST_CODE_SIZE];
 
 uint64_t total_rx_iso_packet_count; /* This value is exposed to test code */
+
+static int stop_adv(void);
 
 #if defined(CONFIG_USB_DEVICE_AUDIO)
 static int16_t usb_audio_data[MAX_NUM_SAMPLES_STEREO] = {0};
@@ -639,7 +641,7 @@ static int pa_sync_past(struct bt_conn *conn, uint16_t pa_interval)
 	if (err != 0) {
 		printk("Could not do PAST subscribe: %d\n", err);
 	} else {
-		printk("Syncing with PAST: %d\n", err);
+		printk("Syncing with PAST\n");
 		(void)k_work_reschedule(&pa_timer, K_MSEC(param.timeout * 10));
 	}
 
@@ -650,7 +652,9 @@ static int pa_sync_req_cb(struct bt_conn *conn,
 			  const struct bt_bap_scan_delegator_recv_state *recv_state,
 			  bool past_avail, uint16_t pa_interval)
 {
-	int err;
+
+	printk("Received request to sync to PA (PAST %savailble): %u\n", past_avail ? "" : "not ",
+	       recv_state->pa_sync_state);
 
 	req_recv_state = recv_state;
 
@@ -662,16 +666,29 @@ static int pa_sync_req_cb(struct bt_conn *conn,
 	}
 
 	if (IS_ENABLED(CONFIG_BT_PER_ADV_SYNC_TRANSFER_RECEIVER) && past_avail) {
+		int err;
+
 		err = pa_sync_past(conn, pa_interval);
+		if (err != 0) {
+			printk("Failed to subscribe to PAST: %d\n", err);
+
+			return err;
+		}
+
 		k_sem_give(&sem_past_request);
-	} else {
-		/* start scan */
-		err = 0;
+
+		err = bt_bap_scan_delegator_set_pa_state(recv_state->src_id,
+							 BT_BAP_PA_STATE_INFO_REQ);
+		if (err != 0) {
+			printk("Failed to set PA state to BT_BAP_PA_STATE_INFO_REQ: %d\n", err);
+
+			return err;
+		}
 	}
 
 	k_sem_give(&sem_pa_request);
 
-	return err;
+	return 0;
 }
 
 static int pa_sync_term_req_cb(struct bt_conn *conn,
@@ -708,7 +725,7 @@ static void broadcast_code_cb(struct bt_conn *conn,
 
 static int bis_sync_req_cb(struct bt_conn *conn,
 			   const struct bt_bap_scan_delegator_recv_state *recv_state,
-			   const uint32_t bis_sync_req[BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS])
+			   const uint32_t bis_sync_req[CONFIG_BT_BAP_BASS_MAX_SUBGROUPS])
 {
 	const bool bis_synced = k_sem_count_get(&sem_bis_synced) > 0U;
 
@@ -887,7 +904,12 @@ static void broadcast_scan_recv(const struct bt_le_scan_recv_info *info, struct 
 {
 	if (info->interval != 0U) {
 		/* call to bt_data_parse consumes netbufs so shallow clone for verbose output */
-		if (strlen(CONFIG_TARGET_BROADCAST_NAME) > 0U) {
+
+		/* If req_recv_state is NULL then we have been requested by a broadcast assistant to
+		 * sync to a specific broadcast source. In that case we do not apply our own
+		 * broadcast name filter.
+		 */
+		if (req_recv_state != NULL && strlen(CONFIG_TARGET_BROADCAST_NAME) > 0U) {
 			struct net_buf_simple buf_copy;
 			char name[NAME_LEN] = {0};
 
@@ -908,10 +930,17 @@ static struct bt_le_scan_cb bap_scan_cb = {
 static void bap_pa_sync_synced_cb(struct bt_le_per_adv_sync *sync,
 				  struct bt_le_per_adv_sync_synced_info *info)
 {
-	if (sync == pa_sync) {
+	if (sync == pa_sync ||
+	    (req_recv_state != NULL && bt_addr_le_eq(info->addr, &req_recv_state->addr) &&
+	     info->sid == req_recv_state->adv_sid)) {
 		printk("PA sync %p synced for broadcast sink with broadcast ID 0x%06X\n", sync,
 		       broadcaster_broadcast_id);
 
+		if (pa_sync == NULL) {
+			pa_sync = sync;
+		}
+
+		k_work_cancel_delayable(&pa_timer);
 		k_sem_give(&sem_pa_synced);
 	}
 }
@@ -1036,24 +1065,10 @@ static int reset(void)
 
 				return err;
 			}
-		} else if (ext_adv != NULL) { /* advertising still running */
-			err = bt_le_ext_adv_stop(ext_adv);
-			if (err) {
-				printk("Stopping advertising set failed (err %d)\n",
-				       err);
+		}
 
-				return err;
-			}
-
-			err = bt_le_ext_adv_delete(ext_adv);
-			if (err) {
-				printk("Deleting advertising set failed (err %d)\n",
-				       err);
-
-				return err;
-			}
-
-			ext_adv = NULL;
+		if (ext_adv != NULL) {
+			stop_adv();
 		}
 
 		k_sem_reset(&sem_connected);
@@ -1080,6 +1095,7 @@ static int start_adv(void)
 		BT_DATA_BYTES(BT_DATA_UUID16_ALL,
 			      BT_UUID_16_ENCODE(BT_UUID_BASS_VAL),
 			      BT_UUID_16_ENCODE(BT_UUID_PACS_VAL)),
+		BT_DATA_BYTES(BT_DATA_SVC_DATA16, BT_UUID_16_ENCODE(BT_UUID_BASS_VAL)),
 	};
 	int err;
 
@@ -1197,6 +1213,7 @@ int main(void)
 				/* Wait for the PA request to determine if we
 				 * should start scanning, or wait for PAST
 				 */
+				printk("Waiting for PA sync request\n");
 				err = k_sem_take(&sem_pa_request,
 						 BROADCAST_ASSISTANT_TIMEOUT);
 				if (err != 0) {
@@ -1278,17 +1295,17 @@ wait_for_pa_sync:
 		/* sem_broadcast_code_received is also given if the
 		 * broadcast is not encrypted
 		 */
-		printk("Waiting for broadcast code OK\n");
+		printk("Waiting for broadcast code\n");
 		err = k_sem_take(&sem_broadcast_code_received, SEM_TIMEOUT);
 		if (err != 0) {
-			printk("sem_syncable timed out, resetting\n");
+			printk("sem_broadcast_code_received timed out, resetting\n");
 			continue;
 		}
 
 		printk("Waiting for BIS sync request\n");
 		err = k_sem_take(&sem_bis_sync_requested, SEM_TIMEOUT);
 		if (err != 0) {
-			printk("sem_syncable timed out, resetting\n");
+			printk("sem_bis_sync_requested timed out, resetting\n");
 			continue;
 		}
 

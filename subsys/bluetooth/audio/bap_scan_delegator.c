@@ -38,6 +38,7 @@ static K_SEM_DEFINE(read_buf_sem, 1, 1);
 NET_BUF_SIMPLE_DEFINE_STATIC(read_buf, BT_ATT_MAX_ATTRIBUTE_LEN);
 
 enum bass_recv_state_internal_flag {
+	/* TODO: Replace this flag with a k_work_delayable */
 	BASS_RECV_STATE_INTERNAL_FLAG_NOTIFY_PEND,
 
 	BASS_RECV_STATE_INTERNAL_FLAG_NUM,
@@ -58,7 +59,7 @@ struct bass_recv_state_internal {
 	uint8_t broadcast_code[BT_AUDIO_BROADCAST_CODE_SIZE];
 	struct bt_le_per_adv_sync *pa_sync;
 	/** Requested BIS sync bitfield for each subgroup */
-	uint32_t requested_bis_sync[BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS];
+	uint32_t requested_bis_sync[CONFIG_BT_BAP_BASS_MAX_SUBGROUPS];
 
 	ATOMIC_DEFINE(flags, BASS_RECV_STATE_INTERNAL_FLAG_NUM);
 };
@@ -131,7 +132,7 @@ static void bt_debug_dump_recv_state(const struct bass_recv_state_internal *recv
 		state->num_subgroups);
 
 	for (int i = 0; i < state->num_subgroups; i++) {
-		const struct bt_bap_scan_delegator_subgroup *subgroup = &state->subgroups[i];
+		const struct bt_bap_bass_subgroup *subgroup = &state->subgroups[i];
 
 		LOG_DBG("\tSubgroup[%d]: BIS sync %u (requested %u), metadata_len %zu, metadata: "
 			"%s",
@@ -197,7 +198,7 @@ static void net_buf_put_recv_state(const struct bass_recv_state_internal *recv_s
 	}
 	(void)net_buf_simple_add_u8(&read_buf, state->num_subgroups);
 	for (int i = 0; i < state->num_subgroups; i++) {
-		const struct bt_bap_scan_delegator_subgroup *subgroup = &state->subgroups[i];
+		const struct bt_bap_bass_subgroup *subgroup = &state->subgroups[i];
 
 		(void)net_buf_simple_add_le32(&read_buf, subgroup->bis_sync >> 1);
 		(void)net_buf_simple_add_u8(&read_buf, subgroup->metadata_len);
@@ -451,6 +452,11 @@ static struct bt_le_per_adv_sync_cb pa_sync_cb =  {
 
 static bool supports_past(struct bt_conn *conn, uint8_t pa_sync_val)
 {
+	LOG_DBG("%p remote %s PAST, local %s PAST (req %u)", (void *)conn,
+		BT_FEAT_LE_PAST_SEND(conn->le.features) ? "supports" : "does not support",
+		BT_FEAT_LE_PAST_RECV(bt_dev.le.features) ? "supports" : "does not support",
+		pa_sync_val);
+
 	return pa_sync_val == BT_BAP_BASS_PA_REQ_SYNC_PAST &&
 	       BT_FEAT_LE_PAST_SEND(conn->le.features) &&
 	       BT_FEAT_LE_PAST_RECV(bt_dev.le.features);
@@ -506,7 +512,8 @@ static int scan_delegator_add_source(struct bt_conn *conn,
 
 	internal_state = get_free_recv_state();
 	if (internal_state == NULL) {
-		LOG_DBG("Could not add src");
+		LOG_DBG("Could not get free receive state");
+
 		return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
 	}
 
@@ -539,15 +546,15 @@ static int scan_delegator_add_source(struct bt_conn *conn,
 	pa_interval = net_buf_simple_pull_le16(buf);
 
 	state->num_subgroups = net_buf_simple_pull_u8(buf);
-	if (state->num_subgroups > CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS) {
+	if (state->num_subgroups > CONFIG_BT_BAP_BASS_MAX_SUBGROUPS) {
 		LOG_WRN("Too many subgroups %u/%u", state->num_subgroups,
-			CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS);
+			CONFIG_BT_BAP_BASS_MAX_SUBGROUPS);
 		return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
 	}
 
 	bis_sync_requested = false;
 	for (int i = 0; i < state->num_subgroups; i++) {
-		struct bt_bap_scan_delegator_subgroup *subgroup = &state->subgroups[i];
+		struct bt_bap_bass_subgroup *subgroup = &state->subgroups[i];
 		uint8_t *metadata;
 
 		if (buf->len < (sizeof(subgroup->bis_sync) + sizeof(subgroup->metadata_len))) {
@@ -582,8 +589,12 @@ static int scan_delegator_add_source(struct bt_conn *conn,
 		}
 
 		if (!valid_bis_syncs(internal_state->requested_bis_sync[i])) {
+			LOG_DBG("Invalid BIS sync[%d]: 0x%08X", i,
+				internal_state->requested_bis_sync[i]);
+
 			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 		}
+
 		aggregated_bis_syncs |= internal_state->requested_bis_sync[i];
 
 		subgroup->metadata_len = net_buf_simple_pull_u8(buf);
@@ -595,9 +606,9 @@ static int scan_delegator_add_source(struct bt_conn *conn,
 		}
 
 
-		if (subgroup->metadata_len > CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_METADATA_LEN) {
+		if (subgroup->metadata_len > CONFIG_BT_AUDIO_CODEC_CFG_MAX_METADATA_SIZE) {
 			LOG_WRN("Metadata too long %u/%u", subgroup->metadata_len,
-				CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_METADATA_LEN);
+				CONFIG_BT_AUDIO_CODEC_CFG_MAX_METADATA_SIZE);
 
 			return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
 		}
@@ -612,20 +623,23 @@ static int scan_delegator_add_source(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_WRITE_REQ_REJECTED);
 	}
 
+	/* The active flag shall be set before any application callbacks, so that any calls for the
+	 * receive state can be processed
+	 */
+	internal_state->active = true;
+
+	/* Set NOTIFY_PEND flag to ensure that we only send 1 notification in case that the upper
+	 * layer calls another function that changes the state in the pa_sync_request callback
+	 */
+	atomic_set_bit(internal_state->flags, BASS_RECV_STATE_INTERNAL_FLAG_NOTIFY_PEND);
+
 	if (pa_sync != BT_BAP_BASS_PA_REQ_NO_SYNC) {
 		int err;
-
-		/* Set NOTIFY_PEND flag to ensure that we only send 1
-		 * notification in case that the upper layer calls another
-		 * function that changes the state in the pa_sync_request
-		 * callback
-		 */
-		atomic_set_bit(internal_state->flags,
-			       BASS_RECV_STATE_INTERNAL_FLAG_NOTIFY_PEND);
 		err = pa_sync_request(conn, state, pa_sync, pa_interval);
 
 		if (err != 0) {
 			(void)memset(state, 0, sizeof(*state));
+			internal_state->active = false;
 
 			LOG_DBG("PA sync %u from %p was rejected with reason %d", pa_sync, conn,
 				err);
@@ -633,8 +647,6 @@ static int scan_delegator_add_source(struct bt_conn *conn,
 			return BT_GATT_ERR(BT_ATT_ERR_WRITE_REQ_REJECTED);
 		}
 	}
-
-	internal_state->active = true;
 
 	LOG_DBG("Index %u: New source added: ID 0x%02x",
 		internal_state->index, state->src_id);
@@ -661,8 +673,8 @@ static int scan_delegator_mod_src(struct bt_conn *conn,
 	bool state_changed = false;
 	uint16_t pa_interval;
 	uint8_t num_subgroups;
-	struct bt_bap_scan_delegator_subgroup
-		subgroups[CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS] = { 0 };
+	struct bt_bap_bass_subgroup
+		subgroups[CONFIG_BT_BAP_BASS_MAX_SUBGROUPS] = { 0 };
 	uint8_t pa_sync;
 	uint32_t aggregated_bis_syncs = 0;
 	bool bis_sync_change_requested;
@@ -695,16 +707,16 @@ static int scan_delegator_mod_src(struct bt_conn *conn,
 	pa_interval = net_buf_simple_pull_le16(buf);
 
 	num_subgroups = net_buf_simple_pull_u8(buf);
-	if (num_subgroups > CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS) {
+	if (num_subgroups > CONFIG_BT_BAP_BASS_MAX_SUBGROUPS) {
 		LOG_WRN("Too many subgroups %u/%u", num_subgroups,
-			CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS);
+			CONFIG_BT_BAP_BASS_MAX_SUBGROUPS);
 
 		return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
 	}
 
 	bis_sync_change_requested = false;
 	for (int i = 0; i < num_subgroups; i++) {
-		struct bt_bap_scan_delegator_subgroup *subgroup = &subgroups[i];
+		struct bt_bap_bass_subgroup *subgroup = &subgroups[i];
 		uint32_t old_bis_sync_req;
 		uint8_t *metadata;
 
@@ -753,9 +765,9 @@ static int scan_delegator_mod_src(struct bt_conn *conn,
 			return BT_GATT_ERR(BT_ATT_ERR_WRITE_REQ_REJECTED);
 		}
 
-		if (subgroup->metadata_len > CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_METADATA_LEN) {
+		if (subgroup->metadata_len > CONFIG_BT_AUDIO_CODEC_CFG_MAX_METADATA_SIZE) {
 			LOG_WRN("Metadata too long %u/%u", subgroup->metadata_len,
-				CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_METADATA_LEN);
+				CONFIG_BT_AUDIO_CODEC_CFG_MAX_METADATA_SIZE);
 			return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_RESOURCES);
 		}
 
@@ -803,6 +815,11 @@ static int scan_delegator_mod_src(struct bt_conn *conn,
 		}
 	}
 
+	/* Set NOTIFY_PEND flag to ensure that we only send 1 notification in case that the upper
+	 * layer calls another function that changes the state in the pa_sync_request callback
+	 */
+	atomic_set_bit(internal_state->flags, BASS_RECV_STATE_INTERNAL_FLAG_NOTIFY_PEND);
+
 	/* Only send the sync request to upper layers if it is requested, and
 	 * we are not already synced to the device
 	 */
@@ -835,6 +852,8 @@ static int scan_delegator_mod_src(struct bt_conn *conn,
 
 		state_changed = true;
 	}
+
+	atomic_clear_bit(internal_state->flags, BASS_RECV_STATE_INTERNAL_FLAG_NOTIFY_PEND);
 
 	/* Notify if changed */
 	if (state_changed) {
@@ -1168,7 +1187,7 @@ int bt_bap_scan_delegator_set_pa_state(uint8_t src_id,
 
 int bt_bap_scan_delegator_set_bis_sync_state(
 	uint8_t src_id,
-	uint32_t bis_synced[CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS])
+	uint32_t bis_synced[CONFIG_BT_BAP_BASS_MAX_SUBGROUPS])
 {
 	struct bass_recv_state_internal *internal_state = bass_lookup_src_id(src_id);
 	bool notify = false;
@@ -1186,7 +1205,7 @@ int bt_bap_scan_delegator_set_bis_sync_state(
 
 	/* Verify state for all subgroups before assigning any data */
 	for (uint8_t i = 0U; i < internal_state->state.num_subgroups; i++) {
-		if (i >= CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS) {
+		if (i >= CONFIG_BT_BAP_BASS_MAX_SUBGROUPS) {
 			break;
 		}
 
@@ -1201,10 +1220,10 @@ int bt_bap_scan_delegator_set_bis_sync_state(
 	}
 
 	for (uint8_t i = 0U; i < internal_state->state.num_subgroups; i++) {
-		struct bt_bap_scan_delegator_subgroup *subgroup =
+		struct bt_bap_bass_subgroup *subgroup =
 			&internal_state->state.subgroups[i];
 
-		if (i >= CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS) {
+		if (i >= CONFIG_BT_BAP_BASS_MAX_SUBGROUPS) {
 			break;
 		}
 
@@ -1247,16 +1266,16 @@ static bool valid_bt_bap_scan_delegator_add_src_param(
 		return false;
 	}
 
-	if (param->num_subgroups > CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS) {
+	if (param->num_subgroups > CONFIG_BT_BAP_BASS_MAX_SUBGROUPS) {
 		LOG_WRN("Too many subgroups %u/%u",
 			param->num_subgroups,
-			CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS);
+			CONFIG_BT_BAP_BASS_MAX_SUBGROUPS);
 
 		return false;
 	}
 
 	for (uint8_t i = 0U; i < param->num_subgroups; i++) {
-		const struct bt_bap_scan_delegator_subgroup *subgroup = &param->subgroups[i];
+		const struct bt_bap_bass_subgroup *subgroup = &param->subgroups[i];
 
 		if (!bis_syncs_unique_or_no_pref(subgroup->bis_sync,
 						 aggregated_bis_syncs)) {
@@ -1265,7 +1284,7 @@ static bool valid_bt_bap_scan_delegator_add_src_param(
 			return false;
 		}
 
-		if (subgroup->metadata_len > BT_BAP_SCAN_DELEGATOR_MAX_METADATA_LEN) {
+		if (subgroup->metadata_len > CONFIG_BT_AUDIO_CODEC_CFG_MAX_METADATA_SIZE) {
 			LOG_DBG("subgroup[%u]: Invalid metadata_len: %u",
 				i, subgroup->metadata_len);
 
@@ -1297,7 +1316,7 @@ int bt_bap_scan_delegator_add_src(const struct bt_bap_scan_delegator_add_src_par
 
 	internal_state = get_free_recv_state();
 	if (internal_state == NULL) {
-		LOG_DBG("Could not add src");
+		LOG_DBG("Could not get free receive state");
 
 		return -ENOMEM;
 	}
@@ -1353,16 +1372,16 @@ static bool valid_bt_bap_scan_delegator_mod_src_param(
 		return false;
 	}
 
-	if (param->num_subgroups > CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS) {
+	if (param->num_subgroups > CONFIG_BT_BAP_BASS_MAX_SUBGROUPS) {
 		LOG_WRN("Too many subgroups %u/%u",
 			param->num_subgroups,
-			CONFIG_BT_BAP_SCAN_DELEGATOR_MAX_SUBGROUPS);
+			CONFIG_BT_BAP_BASS_MAX_SUBGROUPS);
 
 		return false;
 	}
 
 	for (uint8_t i = 0U; i < param->num_subgroups; i++) {
-		const struct bt_bap_scan_delegator_subgroup *subgroup = &param->subgroups[i];
+		const struct bt_bap_bass_subgroup *subgroup = &param->subgroups[i];
 
 		if (subgroup->bis_sync == BT_BAP_BIS_SYNC_NO_PREF ||
 		    !bis_syncs_unique_or_no_pref(subgroup->bis_sync,
@@ -1372,7 +1391,7 @@ static bool valid_bt_bap_scan_delegator_mod_src_param(
 			return false;
 		}
 
-		if (subgroup->metadata_len > BT_BAP_SCAN_DELEGATOR_MAX_METADATA_LEN) {
+		if (subgroup->metadata_len > CONFIG_BT_AUDIO_CODEC_CFG_MAX_METADATA_SIZE) {
 			LOG_DBG("subgroup[%u]: Invalid metadata_len: %u",
 				i, subgroup->metadata_len);
 
@@ -1431,8 +1450,8 @@ int bt_bap_scan_delegator_mod_src(const struct bt_bap_scan_delegator_mod_src_par
 	}
 
 	for (uint8_t i = 0U; i < state->num_subgroups; i++) {
-		const struct bt_bap_scan_delegator_subgroup *param_subgroup = &param->subgroups[i];
-		struct bt_bap_scan_delegator_subgroup *subgroup = &state->subgroups[i];
+		const struct bt_bap_bass_subgroup *param_subgroup = &param->subgroups[i];
+		struct bt_bap_bass_subgroup *subgroup = &state->subgroups[i];
 
 		if (subgroup->bis_sync != param_subgroup->bis_sync) {
 			subgroup->bis_sync = param_subgroup->bis_sync;

@@ -567,13 +567,16 @@ Interaction with serial ports can be configured in several different ways:
   options override values from the devicetree.
 * The rest of the configuration options such as number of data and stop bits,
   parity, as well as baud rate can be set at runtime with ``uart_configure``.
+* This driver can emulate an interrupt-driven UART by enabling
+  :kconfig:option:`CONFIG_UART_INTERRUPT_DRIVEN`.
 
 Multiple instances of such uart drivers are supported.
 
 The :zephyr:code-sample:`uart-native-tty` sample app provides a working example of the
 driver.
 
-This driver only supports poll mode. Interrupt and async mode are not supported.
+This driver only supports poll mode and interrupt mode. Async mode is not
+supported.
 It has runtime configuration support, but no line control support.
 
 .. _native_sim_backends:
@@ -610,9 +613,7 @@ development by integrating more seamlessly with the host operating system:
   :kconfig:option:`CONFIG_LOG_MODE_IMMEDIATE`.
 
   This backend can be selected with :kconfig:option:`CONFIG_LOG_BACKEND_NATIVE_POSIX`
-  and is enabled by default unless the PTTY UART is compiled in.
-  In this later case, by default, the logger is set to output to the
-  `PTTY UART`_.
+  and is enabled by default.
 
 .. _nsim_back_trace:
 
